@@ -8,6 +8,11 @@ import (
 	"time"
 )
 
+const (
+	// Forever indicates that Get should wait forever
+	Forever = -1
+)
+
 // Value is an eventual value, meaning that callers wishing to access the value
 // block until the value is available.
 type Value interface {
