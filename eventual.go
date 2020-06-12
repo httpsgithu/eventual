@@ -1,176 +1,86 @@
-// Package eventual provides values that eventually have a value.
 package eventual
 
 import (
-	"math"
+	"context"
 	"sync"
-	"sync/atomic"
-	"time"
 )
 
-const (
-	// Forever indicates that Get should wait forever
-	Forever = -1
-)
+// DontWait is an expired context for use in Value.Get. Using DontWait will cause a Value.Get call
+// to return immediately. If the value has not been set, a context.Canceled error will be returned.
+var DontWait context.Context
 
-// Value is an eventual value, meaning that callers wishing to access the value
-// block until the value is available.
-type Value interface {
-	// Set sets this Value to the given val.
-	Set(val interface{})
-
-	// Get waits up to timeout for the value to be set and returns it, or returns
-	// nil if it times out or Cancel() is called. valid will be false in latter
-	// case. If timeout is 0, Get won't wait. If timeout is -1, Get will wait
-	// forever.
-	Get(timeout time.Duration) (ret interface{}, valid bool)
-
-	// Cancel cancels this value, signaling any waiting calls to Get() that no
-	// value is coming. If no value was set before Cancel() was called, all future
-	// calls to Get() will return nil, false. Subsequent calls to Set after Cancel
-	// have no effect.
-	Cancel()
+func init() {
+	var cancel func()
+	DontWait, cancel = context.WithCancel(context.Background())
+	cancel()
 }
 
-// Getter is a functional interface for the Value.Get function
-type Getter func(time.Duration) (interface{}, bool)
+// Value is an eventual value, meaning that callers wishing to access the value block until it is
+// available.
+type Value interface {
+	// Set this Value.
+	Set(interface{})
+
+	// Get waits for the value to be set. If the context expires first, an error will be returned.
+	//
+	// This function will return immediately when called with an expired context. In this case, the
+	// value will be returned only if it has already been set; otherwise the context error will be
+	// returned. For convenience, see DontWait.
+	Get(context.Context) (interface{}, error)
+}
+
+// NewValue creates a new value.
+func NewValue() Value {
+	return WithDefault(nil)
+}
+
+// WithDefault creates a new value that returns the given defaultValue if a real value isn't
+// available in time.
+func WithDefault(defaultValue interface{}) Value {
+	return &value{defaultValue: defaultValue}
+}
 
 type value struct {
-	state   atomic.Value
-	waiters []chan interface{}
-	mutex   sync.Mutex
+	m            sync.Mutex
+	v            interface{}
+	defaultValue interface{}
+	set          bool
+	waiters      []chan interface{}
 }
 
-type stateholder struct {
-	val      interface{}
-	set      bool
-	canceled bool
-}
-
-// NewValue creates a new Value.
-func NewValue() Value {
-	result := &value{waiters: make([]chan interface{}, 0)}
-	result.state.Store(&stateholder{})
-	return result
-}
-
-// DefaultGetter builds a Getter that always returns the supplied value.
-func DefaultGetter(val interface{}) Getter {
-	return func(time.Duration) (interface{}, bool) {
-		return val, true
-	}
-}
-
-// DefaultUnsetGetter builds a Getter that always !ok.
-func DefaultUnsetGetter() Getter {
-	return func(time.Duration) (interface{}, bool) {
-		return nil, false
-	}
-}
-
-func (v *value) Set(val interface{}) {
-	v.mutex.Lock()
-	defer v.mutex.Unlock()
-
-	state := v.getState()
-	settable := !state.canceled
-	if settable {
-		v.setState(&stateholder{
-			val:      val,
-			set:      true,
-			canceled: false,
-		})
-
-		if v.waiters != nil {
-			// Notify anyone waiting for value
-			for _, waiter := range v.waiters {
-				waiter <- val
-			}
-			// Clear waiters
-			v.waiters = nil
-		}
-	}
-}
-
-func (v *value) Cancel() {
-	v.mutex.Lock()
-	defer v.mutex.Unlock()
-
-	state := v.getState()
-	v.setState(&stateholder{
-		val:      state.val,
-		set:      state.set,
-		canceled: true,
-	})
-
-	if v.waiters != nil {
-		// Notify anyone waiting for value
+func (v *value) Set(i interface{}) {
+	v.m.Lock()
+	v.v = i
+	if !v.set {
+		// This is our first time setting, inform anyone who is waiting
 		for _, waiter := range v.waiters {
-			close(waiter)
+			waiter <- i
 		}
-		// Clear waiters
-		v.waiters = nil
+		v.set = true
 	}
+	v.m.Unlock()
 }
 
-func (v *value) Get(timeout time.Duration) (ret interface{}, valid bool) {
-	state := v.getState()
-
-	// First check for existing value using atomic operations (for speed)
-	if state.set {
-		// Value found, use it
-		return state.val, true
-	} else if state.canceled {
-		// Value was canceled, return false
-		return nil, false
+func (v *value) Get(ctx context.Context) (interface{}, error) {
+	v.m.Lock()
+	if v.set {
+		// Value already set, use existing
+		_v := v.v
+		v.m.Unlock()
+		return _v, nil
 	}
 
-	if timeout == 0 {
-		// Don't wait
-		return nil, false
-	}
-
-	// If we didn't find an existing value, try again but this time using locking
-	v.mutex.Lock()
-	state = v.getState()
-
-	if state.set {
-		// Value found, use it
-		v.mutex.Unlock()
-		return state.val, true
-	} else if state.canceled {
-		// Value was canceled, return false
-		v.mutex.Unlock()
-		return nil, false
-	}
-
-	if timeout == -1 {
-		// Wait essentially forever
-		timeout = time.Duration(math.MaxInt64)
-	}
-
-	// Value not found, register to be notified once value is set
-	valCh := make(chan interface{}, 1)
-	v.waiters = append(v.waiters, valCh)
-	v.mutex.Unlock()
-
-	// Wait up to timeout for value to get set
+	// Value not yet set, wait
+	waiter := make(chan interface{}, 1)
+	v.waiters = append(v.waiters, waiter)
+	v.m.Unlock()
 	select {
-	case v, ok := <-valCh:
-		return v, ok
-	case <-time.After(timeout):
-		return nil, false
+	case _v := <-waiter:
+		return _v, nil
+	case <-ctx.Done():
+		if v.defaultValue != nil {
+			return v.defaultValue, nil
+		}
+		return nil, ctx.Err()
 	}
-}
-
-func (v *value) getState() *stateholder {
-	state := v.state.Load()
-	if state == nil {
-		return nil
-	}
-	return state.(*stateholder)
-}
-
-func (v *value) setState(state *stateholder) {
-	v.state.Store(state)
 }
