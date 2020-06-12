@@ -1,126 +1,158 @@
 package eventual
 
 import (
+	"context"
+	"fmt"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/getlantern/grtrack"
-	"github.com/stretchr/testify/assert"
-)
-
-const (
-	concurrency = 200
+	"github.com/stretchr/testify/require"
 )
 
 func TestSingle(t *testing.T) {
-	goroutines := grtrack.Start()
+	t.Parallel()
+	const (
+		timeUntilSet = 100 * time.Millisecond
+		initialValue = "initial value"
+		nextValue    = "next value"
+	)
+
 	v := NewValue()
 	go func() {
-		time.Sleep(20 * time.Millisecond)
-		v.Set("hi")
+		time.Sleep(timeUntilSet)
+		v.Set(initialValue)
 	}()
 
-	r, ok := v.Get(0)
-	assert.False(t, ok, "Get with no timeout should have failed")
+	shortTimeoutCtx, cancel := context.WithTimeout(context.Background(), timeUntilSet/2)
+	defer cancel()
 
-	r, ok = v.Get(10 * time.Millisecond)
-	assert.False(t, ok, "Get with short timeout should have timed out")
+	_, err := v.Get(shortTimeoutCtx)
+	require.Error(t, err, "Get with short timeout should have timed out")
 
-	r, ok = v.Get(-1)
-	assert.True(t, ok, "Get with really long timeout should have succeeded")
-	assert.Equal(t, "hi", r, "Wrong result")
+	result, err := v.Get(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, initialValue, result)
 
-	// Set a different value
-	v.Set("bye")
-	r, ok = v.Get(0)
-	assert.True(t, ok, "Subsequent get with no timeout should have succeeded")
-	assert.Equal(t, "bye", r, "Value should have changed")
-
-	goroutines.CheckAfter(t, 50*time.Millisecond)
+	v.Set(nextValue)
+	result, err = v.Get(DontWait)
+	require.NoError(t, err, "Get with expired context should have succeeded")
+	require.Equal(t, nextValue, result)
 }
 
 func TestNoSet(t *testing.T) {
-	goroutines := grtrack.Start()
+	t.Parallel()
 	v := NewValue()
 
-	_, ok := v.Get(10 * time.Millisecond)
-	assert.False(t, ok, "Get before setting value should not be okay")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
 
-	goroutines.CheckAfter(t, 50*time.Millisecond)
+	_, err := v.Get(ctx)
+	require.Error(t, err, "Get before Set should return error")
 }
 
-func TestCancelImmediate(t *testing.T) {
+func TestCancel(t *testing.T) {
+	t.Parallel()
 	v := NewValue()
+
+	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
-		time.Sleep(10 * time.Millisecond)
-		v.Cancel()
+		time.Sleep(50 * time.Millisecond)
+		cancel()
 	}()
 
-	_, ok := v.Get(200 * time.Millisecond)
-	assert.False(t, ok, "Get after cancel should have failed")
+	_, err := v.Get(ctx)
+	require.Error(t, err, "Get should respect context cancellation")
 }
 
-func TestCancelAfterSet(t *testing.T) {
-	v := NewValue()
-	v.Set(5)
-	r, ok := v.Get(10 * time.Millisecond)
-	assert.True(t, ok, "Get before cancel should have succeeded")
-	assert.Equal(t, 5, r, "Get got wrong value before cancel")
+func TestConcurrent(t *testing.T) {
+	t.Parallel()
+	const concurrency = 200
 
-	v.Cancel()
-	r, ok = v.Get(0)
-	assert.True(t, ok, "Get after cancel should have succeeded")
-	assert.Equal(t, 5, r, "Get got wrong value after cancel")
+	var (
+		v                  = NewValue()
+		setStart           = make(chan struct{})
+		setGroup, getGroup sync.WaitGroup
+	)
 
-	v.Set(10)
-	r, _ = v.Get(0)
-	assert.Equal(t, 5, r, "Set after cancel should have no effect")
+	go func() {
+		// Do some concurrent setting to make sure that works.
+		for i := 0; i < concurrency; i++ {
+			setGroup.Add(1)
+			go func() {
+				// Coordinate on setStart to run all goroutines at once.
+				<-setStart
+				v.Set("some value")
+				setGroup.Done()
+			}()
+		}
+		close(setStart)
+	}()
+
+	failureChan := make(chan string, concurrency)
+	for i := 0; i < concurrency; i++ {
+		getGroup.Add(1)
+		go func() {
+			defer getGroup.Done()
+			r, err := v.Get(context.Background())
+			if err != nil {
+				failureChan <- err.Error()
+			} else if r != "some value" {
+				failureChan <- fmt.Sprintf("wrong result: %s", r)
+			}
+		}()
+	}
+	getGroup.Wait()
+	close(failureChan)
+
+	failures := map[string]int{}
+	for failure := range failureChan {
+		failures[failure]++
+	}
+	for msg, count := range failures {
+		t.Logf("%d failures with message '%s'", count, msg)
+	}
+	if len(failures) > 0 {
+		t.FailNow()
+	}
+
+	// Ensure all Set calls returned.
+	setGroup.Wait()
+}
+
+func TestWithDefault(t *testing.T) {
+	t.Parallel()
+	const (
+		timeUntilSet = 100 * time.Millisecond
+		defaultValue = "default value"
+		initialValue = "initial value"
+	)
+
+	v := WithDefault(defaultValue)
+	go func() {
+		time.Sleep(timeUntilSet)
+		v.Set(initialValue)
+	}()
+
+	shortTimeoutCtx, cancel := context.WithTimeout(context.Background(), timeUntilSet/2)
+	defer cancel()
+
+	result, err := v.Get(shortTimeoutCtx)
+	require.NoError(t, err, "Get with short timeout should have gotten no error")
+	require.Equal(t, defaultValue, result, "Get with short timeout should have gotten default value")
+
+	result, err = v.Get(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, initialValue, result)
 }
 
 func BenchmarkGet(b *testing.B) {
 	v := NewValue()
-	go func() {
-		time.Sleep(20 * time.Millisecond)
-		v.Set("hi")
-	}()
+	v.Set("foo")
+	ctx := context.Background()
 
+	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		v.Get(20 * time.Millisecond)
+		v.Get(ctx)
 	}
-}
-
-func TestConcurrent(t *testing.T) {
-	goroutines := grtrack.Start()
-	v := NewValue()
-
-	var sets int32
-
-	go func() {
-		var wg sync.WaitGroup
-		wg.Add(1)
-		// Do some concurrent setting to make sure that it works
-		for i := 0; i < concurrency; i++ {
-			go func() {
-				// Wait for waitGroup so that all goroutines run at basically the same
-				// time.
-				wg.Wait()
-				v.Set("hi")
-				atomic.AddInt32(&sets, 1)
-			}()
-		}
-		wg.Done()
-	}()
-
-	for i := 0; i < concurrency; i++ {
-		go func() {
-			r, ok := v.Get(200 * time.Millisecond)
-			assert.True(t, ok, "Get should have succeed")
-			assert.Equal(t, "hi", r, "Wrong result")
-		}()
-	}
-
-	goroutines.CheckAfter(t, 50*time.Millisecond)
-	assert.EqualValues(t, concurrency, atomic.LoadInt32(&sets), "Wrong number of successful Sets")
 }
