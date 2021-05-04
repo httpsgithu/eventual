@@ -14,14 +14,16 @@ func TestSingle(t *testing.T) {
 	t.Parallel()
 	const (
 		timeUntilSet = 100 * time.Millisecond
-		initialValue = "initial value"
-		nextValue    = "next value"
+		v1           = "1"
+		v2           = "2"
+		v3           = "3"
+		v4           = "4"
 	)
 
 	v := NewValue()
 	go func() {
 		time.Sleep(timeUntilSet)
-		v.Set(initialValue)
+		v.Set(v1)
 	}()
 
 	shortTimeoutCtx, cancel := context.WithTimeout(context.Background(), timeUntilSet/2)
@@ -32,12 +34,36 @@ func TestSingle(t *testing.T) {
 
 	result, err := v.Get(context.Background())
 	require.NoError(t, err)
-	require.Equal(t, initialValue, result)
+	require.Equal(t, v1, result)
 
-	v.Set(nextValue)
+	v.Set(v2)
 	result, err = v.Get(DontWait)
 	require.NoError(t, err, "Get with expired context should have succeeded")
-	require.Equal(t, nextValue, result)
+	require.Equal(t, v2, result)
+
+	require.Zero(t, len(v.(*value).waiters), "value should have no remaining waiters")
+
+	v.Reset()
+	_, err = v.Get(shortTimeoutCtx)
+	require.Error(t, err, "Get with short timeout should have timed out after reset")
+
+	go func() {
+		time.Sleep(timeUntilSet)
+		v.Set(v3)
+	}()
+	result, err = v.Get(context.Background())
+	require.NoError(t, err, "Get after reset should have succeeded")
+	require.Equal(t, v3, result)
+
+	v.Reset()
+	go func() {
+		time.Sleep(timeUntilSet)
+		v.Reset()
+		v.Set(v4)
+	}()
+	result, err = v.Get(context.Background())
+	require.NoError(t, err, "Get from before reset should have succeeded")
+	require.Equal(t, v4, result)
 }
 
 func TestNoSet(t *testing.T) {

@@ -21,6 +21,10 @@ type Value interface {
 	// Set this Value.
 	Set(interface{})
 
+	// Reset clears the currently set value, reverting to the same state as if the Eventual had just
+	// been created.
+	Reset()
+
 	// Get waits for the value to be set. If the context expires first, an error will be returned.
 	//
 	// This function will return immediately when called with an expired context. In this case, the
@@ -56,8 +60,16 @@ func (v *value) Set(i interface{}) {
 		for _, waiter := range v.waiters {
 			waiter <- i
 		}
+		v.waiters = make([]chan interface{}, 0)
 		v.set = true
 	}
+	v.m.Unlock()
+}
+
+func (v *value) Reset() {
+	v.m.Lock()
+	v.v = nil
+	v.set = false
 	v.m.Unlock()
 }
 
