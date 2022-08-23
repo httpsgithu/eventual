@@ -22,12 +22,12 @@ func init() {
 
 // Value is an eventual value, meaning that callers wishing to access the value block until it is
 // available.
-type Value[T comparable] interface {
+type Value[V comparable] interface {
 	// Set this Value.
-	Set(T)
+	Set(value V)
 
 	// Set this Value, expiring at the given time.
-	SetExpiring(T, time.Time)
+	SetExpiring(value V, expiration time.Time)
 
 	// Reset clears the currently set value, reverting to the same state as if the Eventual had just
 	// been created.
@@ -38,58 +38,58 @@ type Value[T comparable] interface {
 	// This function will return immediately when called with an expired context. In this case, the
 	// value will be returned only if it has already been set; otherwise the context error will be
 	// returned. For convenience, see DontWait.
-	Get(context.Context) (T, error)
+	Get(context.Context) (V, error)
 
 	// Gets the stored value, or if none available, runs the given func, stores the value as an expiring value,
 	// and returns the result. If func() returns an error, nothing is stored and the error is returned to caller.
-	GetOrSetExpiring(time.Time, func() (T, error)) (T, error)
+	GetOrSetExpiring(expiration time.Time, getter func() (V, error)) (V, error)
 }
 
 // NewValue creates a new value.
-func NewValue[T comparable]() Value[T] {
-	return &value[T]{}
+func NewValue[V comparable]() Value[V] {
+	return &value[V]{}
 }
 
 // WithDefault creates a new value that returns the given defaultValue if a real value isn't
 // available in time.
-func WithDefault[T comparable](defaultValue T) Value[T] {
-	return &value[T]{defaultValue: defaultValue}
+func WithDefault[V comparable](defaultValue V) Value[V] {
+	return &value[V]{defaultValue: defaultValue}
 }
 
-type value[T comparable] struct {
+type value[V comparable] struct {
 	m            sync.Mutex
-	v            T
-	zeroValue    T
-	defaultValue T
+	v            V
+	zeroValue    V
+	defaultValue V
 	expiration   time.Time
 	set          bool
-	waiters      []chan T
+	waiters      []chan V
 }
 
-func (v *value[T]) Set(i T) {
+func (v *value[V]) Set(i V) {
 	v.SetExpiring(i, time.Now().Add(tenYears))
 }
 
-func (v *value[T]) SetExpiring(i T, t time.Time) {
+func (v *value[V]) SetExpiring(i V, t time.Time) {
 	v.m.Lock()
 	v.doSetExpiring(i, t)
 	v.m.Unlock()
 }
 
-func (v *value[T]) doSetExpiring(i T, t time.Time) {
+func (v *value[V]) doSetExpiring(i V, t time.Time) {
 	v.v = i
 	if !v.set {
 		// This is our first time setting, inform anyone who is waiting
 		for _, waiter := range v.waiters {
 			waiter <- i
 		}
-		v.waiters = make([]chan T, 0)
+		v.waiters = make([]chan V, 0)
 		v.expiration = t
 		v.set = true
 	}
 }
 
-func (v *value[T]) Reset() {
+func (v *value[V]) Reset() {
 	v.m.Lock()
 	v.v = v.zeroValue
 	v.expiration = time.Time{}
@@ -97,7 +97,7 @@ func (v *value[T]) Reset() {
 	v.m.Unlock()
 }
 
-func (v *value[T]) Get(ctx context.Context) (T, error) {
+func (v *value[V]) Get(ctx context.Context) (V, error) {
 	v.m.Lock()
 	if v.set {
 		if v.expiration.IsZero() || v.expiration.After(time.Now()) {
@@ -109,7 +109,7 @@ func (v *value[T]) Get(ctx context.Context) (T, error) {
 	}
 
 	// Value not yet set, wait
-	waiter := make(chan T, 1)
+	waiter := make(chan V, 1)
 	v.waiters = append(v.waiters, waiter)
 	v.m.Unlock()
 	select {
@@ -123,7 +123,7 @@ func (v *value[T]) Get(ctx context.Context) (T, error) {
 	}
 }
 
-func (v *value[T]) GetOrSetExpiring(t time.Time, getter func() (T, error)) (T, error) {
+func (v *value[V]) GetOrSetExpiring(t time.Time, getter func() (V, error)) (V, error) {
 	v.m.Lock()
 	if v.set {
 		if v.expiration.IsZero() || v.expiration.After(time.Now()) {
