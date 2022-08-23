@@ -2,6 +2,7 @@ package eventual
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -20,7 +21,7 @@ func TestSingle(t *testing.T) {
 		v4           = "4"
 	)
 
-	v := NewValue()
+	v := NewValue[string]()
 	go func() {
 		time.Sleep(timeUntilSet)
 		v.Set(v1)
@@ -41,7 +42,7 @@ func TestSingle(t *testing.T) {
 	require.NoError(t, err, "Get with expired context should have succeeded")
 	require.Equal(t, v2, result)
 
-	require.Zero(t, len(v.(*value).waiters), "value should have no remaining waiters")
+	require.Zero(t, len(v.(*value[string]).waiters), "value should have no remaining waiters")
 
 	v.Reset()
 	_, err = v.Get(shortTimeoutCtx)
@@ -66,9 +67,20 @@ func TestSingle(t *testing.T) {
 	require.Equal(t, v4, result)
 }
 
+// func TestExpiring(t *testing.T) {
+// 	t.Parallel()
+// 	v := NewValue[int]()
+
+// 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+// 	defer cancel()
+
+// 	_, err := v.Get(ctx)
+// 	require.Error(t, err, "Get before Set should return error")
+// }
+
 func TestNoSet(t *testing.T) {
 	t.Parallel()
-	v := NewValue()
+	v := NewValue[string]()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
@@ -79,7 +91,7 @@ func TestNoSet(t *testing.T) {
 
 func TestCancel(t *testing.T) {
 	t.Parallel()
-	v := NewValue()
+	v := NewValue[string]()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
@@ -96,7 +108,7 @@ func TestConcurrent(t *testing.T) {
 	const concurrency = 200
 
 	var (
-		v                  = NewValue()
+		v                  = NewValue[string]()
 		setStart           = make(chan struct{})
 		setGroup, getGroup sync.WaitGroup
 	)
@@ -146,6 +158,33 @@ func TestConcurrent(t *testing.T) {
 	setGroup.Wait()
 }
 
+func TestSetExpiring(t *testing.T) {
+	v := NewValue[string]()
+	v.SetExpiring("hi", time.Now().Add(50*time.Millisecond))
+	r, err := v.Get(DontWait)
+	require.NoError(t, err)
+	require.EqualValues(t, "hi", r)
+	time.Sleep(50 * time.Millisecond)
+	_, err = v.Get(DontWait)
+	require.Error(t, err)
+}
+
+func TestGetOrSetExpiring(t *testing.T) {
+	v := NewValue[string]()
+	r, err := v.GetOrSetExpiring(time.Now().Add(50*time.Millisecond), func() (string, error) {
+		return "", errors.New("i'm failing")
+	})
+	require.Error(t, err)
+	r, err = v.GetOrSetExpiring(time.Now().Add(50*time.Millisecond), func() (string, error) {
+		return "hi", nil
+	})
+	require.NoError(t, err)
+	require.EqualValues(t, "hi", r)
+	time.Sleep(50 * time.Millisecond)
+	_, err = v.Get(DontWait)
+	require.Error(t, err)
+}
+
 func TestWithDefault(t *testing.T) {
 	t.Parallel()
 	const (
@@ -173,7 +212,7 @@ func TestWithDefault(t *testing.T) {
 }
 
 func BenchmarkGet(b *testing.B) {
-	v := NewValue()
+	v := NewValue[string]()
 	v.Set("foo")
 	ctx := context.Background()
 
