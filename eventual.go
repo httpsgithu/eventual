@@ -78,6 +78,7 @@ func (v *value[V]) SetExpiring(i V, t time.Time) {
 
 func (v *value[V]) doSetExpiring(i V, t time.Time) {
 	v.v = i
+	v.expiration = t
 	if !v.set {
 		// This is our first time setting, inform anyone who is waiting
 		for _, waiter := range v.waiters {

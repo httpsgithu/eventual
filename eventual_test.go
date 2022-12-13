@@ -170,19 +170,30 @@ func TestSetExpiring(t *testing.T) {
 }
 
 func TestGetOrSetExpiring(t *testing.T) {
+	numSets := 0
 	v := NewValue[string]()
 	r, err := v.GetOrSetExpiring(time.Now().Add(50*time.Millisecond), func() (string, error) {
 		return "", errors.New("i'm failing")
 	})
 	require.Error(t, err)
 	r, err = v.GetOrSetExpiring(time.Now().Add(50*time.Millisecond), func() (string, error) {
+		numSets++
 		return "hi", nil
 	})
 	require.NoError(t, err)
 	require.EqualValues(t, "hi", r)
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
 	_, err = v.Get(DontWait)
 	require.Error(t, err)
+	for i := 0; i < 2; i++ {
+		r, err = v.GetOrSetExpiring(time.Now().Add(50*time.Millisecond), func() (string, error) {
+			numSets++
+			return "hi2", nil
+		})
+		require.NoError(t, err)
+		require.Equal(t, "hi2", r)
+		require.Equal(t, 2, numSets)
+	}
 }
 
 func TestWithDefault(t *testing.T) {
